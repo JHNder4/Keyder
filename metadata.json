@@ -1,0 +1,6 @@
+{
+  "name": "Keyder",
+  "description": "Un gestor de credenciales y simulación de llaves de acceso (Passkeys) elegante, minimalista y multiplataforma inspirado en el diseño de Apple.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
