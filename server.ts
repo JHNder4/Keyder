@@ -10,6 +10,8 @@ import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import * as OTPAuth from 'otpauth';
+
 
 // Cargar variables de entorno robustamente
 const dotenvPath = path.join(process.cwd(), '.env');
@@ -293,8 +295,91 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Endpoint de Inicio de Sesión (Login) en Supabase Auth o local_db fallback
-app.post('/api/auth/login', async (req, res) => {
+// Helper para verificar TOTP usando otpauth
+function verifyTOTP(secret: string, code: string): boolean {
+  try {
+    const normalized = secret.trim().replace(/\s+/g, '').toUpperCase();
+    const secretObj = OTPAuth.Secret.fromBase32(normalized);
+    const totp = new OTPAuth.TOTP({
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+      secret: secretObj
+    });
+    const delta = totp.validate({ token: code, window: 1 });
+    return delta !== null;
+  } catch (err) {
+    console.error('Error verificando TOTP:', err);
+    return false;
+  }
+}
+
+// Helper para obtener el 2FA secret de un usuario (de Supabase o Local DB)
+async function getUser2FASecret(userId: string): Promise<string | null> {
+  const clientSupabase = getSupabase();
+  if (clientSupabase && supabaseActive) {
+    try {
+      const { data, error } = await clientSupabase
+        .from('vault_config')
+        .select('value')
+        .eq('key', `2fa_secret_${userId}`);
+      if (!error && data && data.length > 0) {
+        return data[0].value;
+      }
+    } catch (e) {
+      console.warn('Error al buscar 2FA en Supabase:', e);
+    }
+  }
+
+  // Fallback local
+  const db = initLocalFileDB();
+  const config = db.vault_config || [];
+  const found = config.find(c => c.key === `2fa_secret_${userId}`);
+  return found ? found.value : null;
+}
+
+// Helper para guardar el 2FA secret de un usuario (en Supabase o Local DB)
+async function saveUser2FASecret(userId: string, encryptedSecret: string): Promise<boolean> {
+  const clientSupabase = getSupabase();
+  if (clientSupabase && supabaseActive) {
+    try {
+      const { data: existing } = await clientSupabase
+        .from('vault_config')
+        .select('id')
+        .eq('key', `2fa_secret_${userId}`);
+
+      if (existing && existing.length > 0) {
+        const { error } = await clientSupabase
+          .from('vault_config')
+          .update({ value: encryptedSecret })
+          .eq('key', `2fa_secret_${userId}`);
+        if (!error) return true;
+      } else {
+        const { error } = await clientSupabase
+          .from('vault_config')
+          .insert({ key: `2fa_secret_${userId}`, value: encryptedSecret });
+        if (!error) return true;
+      }
+    } catch (e) {
+      console.warn('Error al guardar 2FA en Supabase, reintentando local:', e);
+    }
+  }
+
+  // Fallback local
+  const db = initLocalFileDB();
+  db.vault_config = db.vault_config || [];
+  const idx = db.vault_config.findIndex(c => c.key === `2fa_secret_${userId}`);
+  if (idx > -1) {
+    db.vault_config[idx].value = encryptedSecret;
+  } else {
+    db.vault_config.push({ key: `2fa_secret_${userId}`, value: encryptedSecret });
+  }
+  saveLocalFileDB(db);
+  return true;
+}
+
+// Endpoint de Registro (Sign Up) en Supabase Auth o local_db fallback
+app.post('/api/auth/register', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Correo y contraseña requeridos.' });
@@ -304,7 +389,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (clientSupabase && supabaseActive) {
     try {
-      const { data, error } = await clientSupabase.auth.signInWithPassword({
+      const { data, error } = await clientSupabase.auth.signUp({
         email,
         password
       });
@@ -322,8 +407,8 @@ app.post('/api/auth/login', async (req, res) => {
         }
       });
     } catch (err: any) {
-      console.error('Error de login en Supabase:', err);
-      return res.status(500).json({ error: err.message || 'Error en el servidor de inicio de sesión' });
+      console.error('Error de registro en Supabase:', err);
+      return res.status(500).json({ error: err.message || 'Error en el servidor de autenticación' });
     }
   }
 
@@ -331,29 +416,217 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const db = initLocalFileDB();
     const localUsers: any[] = (db as any).users || [];
-    const found = localUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
-    
-    if (!found) {
-      return res.status(401).json({ error: 'Usuario no encontrado o credenciales incorrectas.' });
+    const exists = localUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
+    if (exists) {
+      return res.status(400).json({ error: 'El correo electrónico ya está registrado.' });
     }
 
-    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
-    if (found.passwordHash !== inputHash) {
-      return res.status(401).json({ error: 'Contraseña incorrecta.' });
-    }
+    const newUser = {
+      id: crypto.randomUUID(),
+      email: email.toLowerCase(),
+      passwordHash: crypto.createHash('sha256').update(password).digest('hex')
+    };
+
+    localUsers.push(newUser);
+    (db as any).users = localUsers;
+    saveLocalFileDB(db);
 
     return res.json({
       success: true,
       user: {
-        id: found.id,
-        email: found.email,
-        token: 'local-token-' + found.id
+        id: newUser.id,
+        email: newUser.email,
+        token: 'local-token-' + newUser.id
       }
     });
   } catch (err: any) {
-    return res.status(500).json({ error: 'Error interno en login local: ' + err.message });
+    return res.status(500).json({ error: 'Error interno en registro local: ' + err.message });
   }
 });
+
+// Endpoint de Inicio de Sesión (Login) en Supabase Auth o local_db fallback
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Correo y contraseña requeridos.' });
+  }
+
+  const clientSupabase = getSupabase();
+  let userDetails: any = null;
+
+  if (clientSupabase && supabaseActive) {
+    try {
+      const { data, error } = await clientSupabase.auth.signInWithPassword({
+        email,
+        password
+      });
+
+      if (error) {
+        return res.status(400).json({ error: error.message });
+      }
+
+      userDetails = {
+        id: data.user?.id,
+        email: data.user?.email,
+        token: data.session?.access_token || ''
+      };
+    } catch (err: any) {
+      console.error('Error de login en Supabase:', err);
+      return res.status(500).json({ error: err.message || 'Error en el servidor de inicio de sesión' });
+    }
+  } else {
+    // Modo local / Sandbox
+    try {
+      const db = initLocalFileDB();
+      const localUsers: any[] = (db as any).users || [];
+      const found = localUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
+      
+      if (!found) {
+        return res.status(401).json({ error: 'Usuario no encontrado o credenciales incorrectas.' });
+      }
+
+      const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+      if (found.passwordHash !== inputHash) {
+        return res.status(401).json({ error: 'Contraseña incorrecta.' });
+      }
+
+      userDetails = {
+        id: found.id,
+        email: found.email,
+        token: 'local-token-' + found.id
+      };
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Error interno en login local: ' + err.message });
+    }
+  }
+
+  if (userDetails) {
+    // Verificar si tiene 2FA configurado
+    const has2FA = await getUser2FASecret(userDetails.id);
+    if (has2FA) {
+      return res.json({
+        success: true,
+        requires2FA: true,
+        user: {
+          id: userDetails.id,
+          email: userDetails.email
+        }
+      });
+    }
+
+    return res.json({
+      success: true,
+      requires2FA: false,
+      user: userDetails
+    });
+  }
+
+  return res.status(401).json({ error: 'Credenciales inválidas.' });
+});
+
+// Endpoint para verificar el código 2FA y completar el inicio de sesión
+app.post('/api/auth/verify-2fa', async (req, res) => {
+  const { email, password, code } = req.body;
+  if (!email || !password || !code) {
+    return res.status(400).json({ error: 'Correo, contraseña maestra y código 2FA requeridos.' });
+  }
+
+  const clientSupabase = getSupabase();
+  let userDetails: any = null;
+
+  // 1. Re-autenticar al usuario para asegurar credenciales vigentes
+  if (clientSupabase && supabaseActive) {
+    try {
+      const { data, error } = await clientSupabase.auth.signInWithPassword({ email, password });
+      if (error) return res.status(401).json({ error: error.message });
+      userDetails = {
+        id: data.user?.id,
+        email: data.user?.email,
+        token: data.session?.access_token || ''
+      };
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  } else {
+    const db = initLocalFileDB();
+    const localUsers: any[] = (db as any).users || [];
+    const found = localUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
+    if (!found) return res.status(401).json({ error: 'Usuario no encontrado.' });
+    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+    if (found.passwordHash !== inputHash) return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    userDetails = {
+      id: found.id,
+      email: found.email,
+      token: 'local-token-' + found.id
+    };
+  }
+
+  // 2. Obtener y descifrar el secreto de 2FA
+  const encryptedSecret = await getUser2FASecret(userDetails.id);
+  if (!encryptedSecret) {
+    return res.status(400).json({ error: '2FA no está configurado para esta cuenta.' });
+  }
+
+  const decryptedSecret = decrypt(encryptedSecret, password);
+  if (decryptedSecret.startsWith('[Cifrado')) {
+    return res.status(400).json({ error: 'Error al descifrar llave 2FA (¿Contraseña inválida?)' });
+  }
+
+  // 3. Validar el código TOTP
+  const isValid = verifyTOTP(decryptedSecret, code);
+  if (!isValid) {
+    return res.status(400).json({ error: 'Código 2FA incorrecto o expirado.' });
+  }
+
+  // Éxito: Retornar sesión completa
+  res.json({
+    success: true,
+    user: userDetails
+  });
+});
+
+// Endpoint para configurar y registrar 2FA por primera vez
+app.post('/api/auth/setup-2fa', async (req, res) => {
+  const { email, password, secret, code } = req.body;
+  if (!email || !password || !secret || !code) {
+    return res.status(400).json({ error: 'Faltan parámetros para configurar 2FA.' });
+  }
+
+  const clientSupabase = getSupabase();
+  let userId = '';
+
+  // Verificar credenciales del usuario
+  if (clientSupabase && supabaseActive) {
+    try {
+      const { data, error } = await clientSupabase.auth.signInWithPassword({ email, password });
+      if (error) return res.status(401).json({ error: error.message });
+      userId = data.user?.id || '';
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  } else {
+    const db = initLocalFileDB();
+    const localUsers: any[] = (db as any).users || [];
+    const found = localUsers.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
+    if (!found) return res.status(401).json({ error: 'Usuario no encontrado.' });
+    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+    if (found.passwordHash !== inputHash) return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    userId = found.id;
+  }
+
+  // Validar código OTP con el secreto enviado
+  const isValid = verifyTOTP(secret, code);
+  if (!isValid) {
+    return res.status(400).json({ error: 'Código de verificación de 2FA inválido.' });
+  }
+
+  // Cifrar el secreto 2FA con la contraseña maestra y guardar
+  const encryptedSecret = encrypt(secret, password);
+  await saveUser2FASecret(userId, encryptedSecret);
+
+  res.json({ success: true, message: '2FA activado y configurado exitosamente' });
+});
+
 
 // Obtener todas las cuentas del usuario autenticado (con descifrado seguro)
 app.get('/api/accounts', async (req, res) => {

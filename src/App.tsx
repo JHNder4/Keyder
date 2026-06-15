@@ -88,7 +88,7 @@ export default function App() {
   };
 
   // Desbloquear / Iniciar Sesión (Login)
-  const handleLogin = async (email: string, passwordOrder: string): Promise<{ success: boolean; error?: string }> => {
+  const handleLogin = async (email: string, passwordOrder: string): Promise<{ success: boolean; requires2FA?: boolean; error?: string }> => {
     try {
       const resp = await fetch('/api/auth/login', {
         method: 'POST',
@@ -98,13 +98,16 @@ export default function App() {
 
       if (resp.ok) {
         const body = await resp.json();
+        if (body.requires2FA) {
+          return { success: true, requires2FA: true };
+        }
         setUser(body.user);
         setMasterPassword(passwordOrder);
         setIsLocked(false);
         localStorage.setItem('keyder_user', JSON.stringify(body.user));
         sessionStorage.setItem('keyder_master_password', passwordOrder);
         await loadData(passwordOrder, body.user);
-        return { success: true };
+        return { success: true, requires2FA: false };
       } else {
         const err = await resp.json();
         return { success: false, error: err.error || 'Credenciales incorrectas' };
@@ -125,6 +128,27 @@ export default function App() {
       });
 
       if (resp.ok) {
+        return { success: true };
+      } else {
+        const err = await resp.json();
+        return { success: false, error: err.error || 'Error al registrar el usuario' };
+      }
+    } catch (err) {
+      console.error(err);
+      return { success: false, error: 'No se pudo conectar al servidor de autenticación' };
+    }
+  };
+
+  // Verificar código 2FA
+  const handleVerify2FA = async (email: string, passwordOrder: string, code: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const resp = await fetch('/api/auth/verify-2fa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: passwordOrder, code })
+      });
+
+      if (resp.ok) {
         const body = await resp.json();
         setUser(body.user);
         setMasterPassword(passwordOrder);
@@ -135,11 +159,33 @@ export default function App() {
         return { success: true };
       } else {
         const err = await resp.json();
-        return { success: false, error: err.error || 'Error al registrar el usuario' };
+        return { success: false, error: err.error || 'Código 2FA incorrecto o expirado' };
       }
     } catch (err) {
       console.error(err);
-      return { success: false, error: 'No se pudo conectar al servidor de autenticación' };
+      return { success: false, error: 'No se pudo conectar al servidor de verificación 2FA' };
+    }
+  };
+
+  // Configurar 2FA por primera vez
+  const handleSetup2FA = async (email: string, passwordOrder: string, secret: string, code: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const resp = await fetch('/api/auth/setup-2fa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: passwordOrder, secret, code })
+      });
+
+      if (resp.ok) {
+        // Al configurar 2FA con éxito, se hace login automático
+        return handleLogin(email, passwordOrder);
+      } else {
+        const err = await resp.json();
+        return { success: false, error: err.error || 'Código de verificación 2FA incorrecto' };
+      }
+    } catch (err) {
+      console.error(err);
+      return { success: false, error: 'No se pudo conectar al servidor para configurar 2FA' };
     }
   };
 
@@ -320,7 +366,14 @@ export default function App() {
   }, [isLocked, user, masterPassword]);
 
   if (isLocked || !user) {
-    return <LockScreen onLogin={handleLogin} onRegister={handleRegister} />;
+    return (
+      <LockScreen 
+        onLogin={handleLogin} 
+        onRegister={handleRegister} 
+        onVerify2FA={handleVerify2FA}
+        onSetup2FA={handleSetup2FA}
+      />
+    );
   }
 
   return (
